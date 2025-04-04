@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+CMakeFiles/
+*.o
+*.so
+*.a
+*.out
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+
+# System files
+.DS_Store
+
+data/*
+
+!data/
+
+results/
