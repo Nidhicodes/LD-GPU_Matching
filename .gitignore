@@ -19,3 +19,6 @@ data/*
 !data/
 
 results/
+
+#Readme file
+README.md

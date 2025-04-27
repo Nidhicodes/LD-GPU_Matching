@@ -18,16 +18,18 @@ int main(int argc, char* argv[]) {
     Graph graph;
     graph.loadFromFile(graph_file);
     
-    // Create matcher
+    // time starts now
     auto start = std::chrono::high_resolution_clock::now();
-    
+
+    // Create matcher
     LD_GPU_Matcher matcher(graph, num_gpus, max_batches);
     matcher.computeMatching();
     
+    //  time ends here
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     
-    std::cout << "Total execution time: " << elapsed.count() << " seconds" << std::endl;
+    std::cout << "\n[[ Total execution time: " << elapsed.count() << " seconds ]]\n" << std::endl;
     
     return 0;
 }

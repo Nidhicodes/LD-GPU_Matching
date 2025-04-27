@@ -48,6 +48,7 @@ __global__ void setPointersKernel(size_t* vertex_batch, size_t num_vertices_batc
     if (idx >= num_vertices_batch) return;
     
     size_t u = vertex_batch[idx];
+
     
     // Skip if already matched
     if (mate[u] != SIZE_MAX) return;
@@ -74,6 +75,7 @@ __global__ void setPointersKernel(size_t* vertex_batch, size_t num_vertices_batc
     
     // Set pointer to heaviest available neighbor
     pointers[u] = best_v;
+    // printf("Vertex %llu points to %llu with weight %f\n", u, best_v, best_weight);
 }
 
 // Kernel for the matching phase
@@ -99,9 +101,13 @@ LD_GPU_Matcher::LD_GPU_Matcher(Graph& graph, int num_gpus, int max_batches_per_d
     // Initialize host arrays
     h_pointers.resize(graph.num_vertices, SIZE_MAX);
     h_mate.resize(graph.num_vertices, SIZE_MAX);
-    
+
     // Set up devices
-    setupDevices();
+    std::cerr << "*** Requested " << num_gpus << " GPU(s), and ";
+    setupDevices(num_gpus);
+
+    std::cerr << num_gpus << " GPU(s) are available. ***" << std::endl;
+    std::cout << "Using " << num_gpus << " GPU(s) for matching..." << std::endl<< std::endl;
     
     // Partition graph
     graph.partitionGraph(num_gpus, graph_partitions);
@@ -169,20 +175,19 @@ LD_GPU_Matcher::~LD_GPU_Matcher() {
     }
 }
 
-void LD_GPU_Matcher::setupDevices() {
+void LD_GPU_Matcher::setupDevices(int& num_gpus) {
     int device_count;
     CUDA_CHECK(cudaGetDeviceCount(&device_count));
     
     if (num_gpus > device_count) {
-        std::cerr << "Requested " << num_gpus << " GPUs, but only " << device_count << " are available." << std::endl;
         num_gpus = device_count;
     }
-    
-    std::cout << "Using " << num_gpus << " GPUs for matching." << std::endl;
 }
 
 void LD_GPU_Matcher::createBatches(int max_batches_per_device) {
     batch_offsets.resize(num_gpus);
+
+    setupDevices(num_gpus);
     
     for (int gpu = 0; gpu < num_gpus; ++gpu) {
         const Graph& partition = graph_partitions[gpu];
@@ -197,8 +202,9 @@ void LD_GPU_Matcher::createBatches(int max_batches_per_device) {
         
         gpu_batches.push_back(partition.num_vertices);
         
-        std::cout << "GPU " << gpu << " has " << (gpu_batches.size() - 1) << " batches." << std::endl;
+        std::cout << "// GPU " << gpu << " has " << (gpu_batches.size() - 1) << " batches. //" << std::endl;
     }
+    std::cout << std::endl;
 }
 
 void LD_GPU_Matcher::setupNCCL() {
@@ -220,11 +226,11 @@ void LD_GPU_Matcher::cleanupNCCL() {
 
 bool LD_GPU_Matcher::executeIterationBatched() {
     bool new_matches = false;
+
+    std::cout << "     Total mates: " << h_mate.size() << std::endl << std::endl;
     
-    // Reset pointers
-    for (size_t i = 0; i < h_pointers.size(); ++i) {
-        h_pointers[i] = SIZE_MAX;
-    }
+    
+    
     
     // Pointing phase
     for (int gpu = 0; gpu < num_gpus; ++gpu) {
@@ -235,9 +241,12 @@ bool LD_GPU_Matcher::executeIterationBatched() {
         
         const Graph& partition = graph_partitions[gpu];
         const std::vector<size_t>& gpu_batches = batch_offsets[gpu];
+
+        
         
         // Process each batch
         for (size_t b = 0; b < gpu_batches.size() - 1; ++b) {
+            
             int stream_idx = b % 2;
             cudaStream_t& stream = streams[stream_idx][gpu];
             
@@ -256,6 +265,8 @@ bool LD_GPU_Matcher::executeIterationBatched() {
             CUDA_CHECK(cudaMalloc(&d_vertex_batch, sizeof(size_t) * batch_size));
             CUDA_CHECK(cudaMemcpyAsync(d_vertex_batch, vertex_batch.data(), sizeof(size_t) * batch_size, 
                                        cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(d_pointers[gpu], h_pointers.data(), sizeof(size_t) * h_pointers.size(), 
+                                       cudaMemcpyHostToDevice, stream));
             
             // Launch kernel for pointing phase
             int blocks = (batch_size + threads_per_block - 1) / threads_per_block;
@@ -267,6 +278,8 @@ bool LD_GPU_Matcher::executeIterationBatched() {
             
             // Free batch memory
             CUDA_CHECK(cudaFree(d_vertex_batch));
+
+            CUDA_CHECK(cudaDeviceSynchronize());
             
             // Synchronize stream
             CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -295,14 +308,18 @@ bool LD_GPU_Matcher::executeIterationBatched() {
         // Copy updated matching back to host
         CUDA_CHECK(cudaMemcpy(h_mate.data(), d_mate[gpu], sizeof(size_t) * h_mate.size(), cudaMemcpyDeviceToHost));
     }
+
+    
     
     // Check if any new matches were found
     for (size_t i = 0; i < h_mate.size(); ++i) {
-        if (h_mate[i] != SIZE_MAX && h_pointers[i] != SIZE_MAX) {
+        if (h_mate[i] != SIZE_MAX && h_pointers[i] != SIZE_MAX && h_pointers[i] != i) {
             new_matches = true;
-            break;
+            h_pointers[i] = i; // Make sure that they are not counted in next iteration's matching
         }
     }
+
+    std::cout << "==> New matches found: " << new_matches << std::endl;
     
     return new_matches;
 }
@@ -310,18 +327,27 @@ bool LD_GPU_Matcher::executeIterationBatched() {
 void LD_GPU_Matcher::computeMatching() {
     int iteration = 0;
     bool continue_matching = true;
+
+    // Set up devices
+    setupDevices(num_gpus);
+
+    // // Initializes pointers to SIZE_MAX(i.e, infinity)
+    // for (size_t i = 0; i < h_pointers.size(); ++i) {
+    //     h_pointers[i] = SIZE_MAX;
+    // }
     
-    while (continue_matching) {
-        std::cout << "Starting iteration " << iteration << std::endl;
+    while (continue_matching || iteration == 1) {
+        std::cout << "  [Starting iteration " << iteration << "]" << std::endl;
         
         continue_matching = executeIterationBatched();
         
         if (!continue_matching) {
-            std::cout << "No new matches found in iteration " << iteration << std::endl;
-            break;
+            std::cout << "==> No new matches found in iteration " << iteration << std::endl << std::endl;
+            if(iteration != 0)break;
         }
-        
+        std::cout << std::endl;
         iteration++;
+        // if(iteration == 1) continue_matching = true;
     }
     
     // Count matches
@@ -329,11 +355,16 @@ void LD_GPU_Matcher::computeMatching() {
     for (size_t i = 0; i < h_mate.size(); ++i) {
         if (h_mate[i] != SIZE_MAX) {
             num_matches++;
+
+            // If you want to see the matched pairs, uncomment the following line -->
+            // std::cout << "Vertex " << i << " matched with " << h_mate[i] << std::endl;
         }
     }
     
-    std::cout << "Matching completed in " << iteration << " iterations." << std::endl;
-    std::cout << "Found " << num_matches / 2 << " matched pairs." << std::endl;
+    std::cout << ">>>> Matching completed. <<<<" << std::endl;
+    std::cout << "\n\n# Final Results:" << std::endl;
+    std::cout << "- Matching completed in " << iteration << " iterations." << std::endl;
+    std::cout << "- Found " << num_matches / 2 << " matched pairs." << std::endl;
 }
 
 const std::vector<size_t>& LD_GPU_Matcher::getMatching() const {
