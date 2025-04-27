@@ -25,7 +25,7 @@ private:
     // Kernel launch parameters
     int threads_per_block;
     
-    void setupDevices();
+    void setupDevices(int& num_gpus);
     void createBatches(int max_batches_per_device);
     void setupNCCL();
     void cleanupNCCL();

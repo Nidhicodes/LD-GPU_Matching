@@ -66,7 +66,7 @@ void Graph::loadFromFile(const std::string& filename) {
         offsets[i] += offsets[i - 1];
     }
     
-    std::cout << "Graph loaded: " << num_vertices << " vertices, " << num_edges << " edges" << std::endl;
+    std::cout << "\n {Graph loaded: " << num_vertices << " vertices, " << num_edges << " edges}" << std::endl<< std::endl;
 }
 
 void Graph::copyToDevice() {
@@ -191,8 +191,10 @@ void Graph::partitionGraph(int num_gpus, std::vector<Graph>& partitions) {
             partition.weights[i] = weights[start_e + i];
         }
 
-        std::cout << "Partition " << p << ": " << partition.num_vertices << " vertices, "
-                  << partition.num_edges << " edges" << std::endl;
+        std::cout << ">> Partition " << p << ": " << partition.num_vertices << " vertices, "
+                  << partition.num_edges << " edges. <<" << std::endl;
     }
+    std::cout << std::endl;
+
 }
 
