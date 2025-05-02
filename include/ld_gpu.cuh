@@ -40,10 +40,4 @@ public:
     const std::vector<size_t>& getMatching() const;
 };
 
-__global__ void setPointersKernel(size_t* vertex_batch, size_t num_vertices, 
-                                 size_t* offsets, size_t* edges, float* weights,
-                                 size_t* pointers, size_t* mate);
-
-__global__ void setMatesKernel(size_t num_vertices, size_t* pointers, size_t* mate);
-
-#endif 
+#endif
