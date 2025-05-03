@@ -42,11 +42,16 @@
                 weight = other_weight;
                 val = other_val;
             }
+            else if (other_weight == weight && other_val < val && other_val != SIZE_MAX)
+            {
+                // For ties, pick the vertex with the lower ID for deterministic behavior
+                weight = other_weight;
+                val = other_val;
+            }
         }
         *max_weight = weight;
         return val;
     }
-
 // Kernel for the pointing phase
 __global__ void setPointersKernel(size_t *vertex_batch, size_t num_vertices_batch,
                                size_t *offsets, size_t *edges, float *weights,
@@ -68,8 +73,8 @@ __global__ void setPointersKernel(size_t *vertex_batch, size_t num_vertices_batc
     float best_weight = -1.0f;
 
     // Process neighbors
-    size_t start = offsets[u];
-    size_t end = offsets[u + 1];
+    size_t start = offsets[local_u];
+    size_t end = offsets[local_u + 1];
 
     for (size_t e = start; e < end; ++e)
     {
@@ -98,32 +103,39 @@ __global__ void setPointersKernel(size_t *vertex_batch, size_t num_vertices_batc
 
 // Kernel for the matching phase
 __global__ void setMatesKernel(size_t *vertex_batch, size_t num_vertices_batch,
-                               size_t *pointers, size_t *mate,
-                               size_t gpu_vertex_offset, int *has_new_matches)
+    size_t *pointers, size_t *mate,
+    size_t gpu_vertex_offset, int *has_new_matches)
 {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_vertices_batch)
-        return;
+size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+if (idx >= num_vertices_batch)
+return;
 
-    size_t local_u = vertex_batch[idx];  // Local vertex ID within partition
-    size_t global_u = local_u + gpu_vertex_offset; // Global vertex ID
+size_t local_u = vertex_batch[idx];  // Local vertex ID within partition
+size_t global_u = local_u + gpu_vertex_offset; // Global vertex ID
 
-    // Skip if already matched
-    if (mate[global_u] != SIZE_MAX)
-        return;
+// Skip if already matched
+if (mate[global_u] != SIZE_MAX)
+return;
 
-    size_t v = pointers[global_u];
+size_t v = pointers[global_u];
 
-    // Check for mutual pointing
-    if (v != SIZE_MAX && pointers[v] == global_u)
-    {
-        // Atomic operation to ensure only one thread sets the match
-        if (atomicCAS(&mate[global_u], SIZE_MAX, v) == SIZE_MAX)
-        {
-            atomicCAS(&mate[v], SIZE_MAX, global_u);
-            *has_new_matches = 1; // Mark that new matches were found
-        }
-    }
+// Skip if no pointer or pointing to matched vertex
+if (v == SIZE_MAX || mate[v] != SIZE_MAX)
+return;
+
+// Check for mutual pointing
+if (pointers[v] == global_u)
+{
+// To prevent race conditions in matching, match only if u < v
+if (global_u < v) {
+// Atomic operation to ensure only one thread sets the match
+if (atomicCAS(&mate[global_u], SIZE_MAX, v) == SIZE_MAX)
+{
+mate[v] = global_u;  // We're guaranteed no other thread is touching v
+*has_new_matches = 1; // Mark that new matches were found
+}
+}
+}
 }
 
 // Kernel to check for new matches
@@ -393,7 +405,7 @@ bool LD_GPU_Matcher::executeIterationBatched() {
             size_t batch_end = gpu_batches[b + 1];
             size_t batch_size = batch_end - batch_start;
             
-            // Create batch of local vertex IDs
+            // Create batch of local vertex IDs within the partition
             std::vector<size_t> vertex_batch(batch_size);
             for (size_t i = 0; i < batch_size; ++i) {
                 vertex_batch[i] = batch_start + i;
@@ -472,6 +484,10 @@ bool LD_GPU_Matcher::executeIterationBatched() {
     for (size_t i = 0; i < h_mate.size(); ++i) {
         if (h_mate[i] != SIZE_MAX && i < h_mate[i]) {
             matched_count++;
+            if (old_mate[i] == SIZE_MAX) {
+                // If this vertex wasn't matched before but is now, we have a new match
+                has_new_matches = 1;
+            }
         }
     }
     std::cout << "     Total matched pairs: " << matched_count << std::endl;
@@ -487,6 +503,11 @@ bool LD_GPU_Matcher::executeIterationBatched() {
 void LD_GPU_Matcher::computeMatching() {
     int iteration = 0;
     bool continue_matching = true;
+
+    std::fill(h_pointers.begin(), h_pointers.end(), SIZE_MAX);
+    std::fill(h_mate.begin(), h_mate.end(), SIZE_MAX);
+    
+    std::cout << "Initial state: All vertices unmatched" << std::endl;
     
     // Initialize pointers to SIZE_MAX
     std::fill(h_pointers.begin(), h_pointers.end(), SIZE_MAX);
