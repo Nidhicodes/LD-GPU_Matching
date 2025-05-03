@@ -31,6 +31,8 @@ private:
     void setupNCCL();
     void cleanupNCCL();
     bool executeIterationBatched();
+    void debugMatchingState();
+    void validateMatching();
     
 public:
     LD_GPU_Matcher(Graph& graph, int num_gpus, int max_batches_per_device = 2);

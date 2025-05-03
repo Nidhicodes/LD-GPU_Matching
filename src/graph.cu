@@ -187,6 +187,7 @@ void Graph::partitionGraph(int num_gpus, std::vector<Graph>& partitions) {
         partition.weights.resize(partition.num_edges);
 
         for (size_t i = 0; i < partition.num_edges; ++i) {
+            // Keep original global vertex IDs for edges - the kernel will handle the mapping
             partition.edges[i] = edges[start_e + i];
             partition.weights[i] = weights[start_e + i];
         }
@@ -195,6 +196,6 @@ void Graph::partitionGraph(int num_gpus, std::vector<Graph>& partitions) {
                   << partition.num_edges << " edges. <<" << std::endl;
     }
     std::cout << std::endl;
-
 }
+
 
