@@ -49,45 +49,44 @@ __device__ size_t warpReduceMax(size_t val, float weight, float *max_weight)
 
 // Kernel for the pointing phase
 __global__ void setPointersKernel(size_t *vertex_batch, size_t num_vertices_batch,
-                                  size_t *offsets, size_t *edges, float *weights,
-                                  size_t *pointers, size_t *mate)
+    size_t *offsets, size_t *edges, float *weights,
+    size_t *pointers, size_t *mate)
 {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_vertices_batch)
-        return;
+size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+if (idx >= num_vertices_batch)
+return;
 
-    size_t u = vertex_batch[idx];
+size_t u = vertex_batch[idx];
 
-    // Skip if already matched
-    if (mate[u] != SIZE_MAX)
-        return;
+// Skip if already matched
+if (mate[u] != SIZE_MAX)
+return;
 
-    size_t best_v = SIZE_MAX;
-    float best_weight = -1.0f;
+size_t best_v = SIZE_MAX;
+float best_weight = -1.0f;
 
-    // Process neighbors
-    size_t start = offsets[u];
-    size_t end = offsets[u + 1];
+// Process neighbors
+size_t start = offsets[u];
+size_t end = offsets[u + 1];
 
-    for (size_t e = start; e < end; ++e)
-    {
-        size_t v = edges[e];
+for (size_t e = start; e < end; ++e)
+{
+size_t v = edges[e];
 
-        // Skip if already matched
-        if (mate[v] != SIZE_MAX)
-            continue;
+// Skip if already matched
+if (mate[v] != SIZE_MAX)
+continue;
 
-        float w = weights[e];
-        if (w > best_weight)
-        {
-            best_weight = w;
-            best_v = v;
-        }
-    }
+float w = weights[e];
+if (w > best_weight)
+{
+best_weight = w;
+best_v = v;
+}
+}
 
-    // Set pointer to heaviest available neighbor
-    pointers[u] = best_v;
-    // printf("Vertex %llu points to %llu with weight %f\n", u, best_v, best_weight);
+// Set pointer to heaviest available neighbor
+pointers[u] = best_v;
 }
 
 // Kernel for the matching phase
@@ -114,6 +113,15 @@ __global__ void setMatesKernel(size_t *vertex_batch, size_t num_vertices_batch,
         {
             atomicCAS(&mate[v], SIZE_MAX, u);
         }
+    }
+}
+
+__global__ void checkNewMatchesKernel(size_t num_vertices, size_t* current_mate, size_t* old_mate, int* has_new_matches) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_vertices) return;
+    
+    if (current_mate[idx] != old_mate[idx]) {
+        *has_new_matches = 1;
     }
 }
 
@@ -223,11 +231,17 @@ void LD_GPU_Matcher::setupDevices(int &num_gpus)
 void LD_GPU_Matcher::createBatches(int max_batches_per_device) {
     batch_offsets.resize(num_gpus);
     
+    size_t total_vertices = 0;
+    for (int gpu = 0; gpu < num_gpus; ++gpu) {
+        total_vertices += graph_partitions[gpu].num_vertices;
+    }
+    
     for (int gpu = 0; gpu < num_gpus; ++gpu) {
         const Graph& partition = graph_partitions[gpu];
         size_t vertices_per_batch = (partition.num_vertices + max_batches_per_device - 1) / max_batches_per_device;
         
         std::vector<size_t>& gpu_batches = batch_offsets[gpu];
+        gpu_batches.clear();
         gpu_batches.push_back(0);
         
         for (size_t v = vertices_per_batch; v < partition.num_vertices; v += vertices_per_batch) {
@@ -295,12 +309,21 @@ bool LD_GPU_Matcher::executeIterationBatched() {
             size_t batch_end = gpu_batches[b + 1];
             size_t batch_size = batch_end - batch_start;
             
-            // Create batch of vertices
+            // Create batch of vertices with global indices
             std::vector<size_t> vertex_batch(batch_size);
             for (size_t i = 0; i < batch_size; ++i) {
-                // Correct indexing based on partition offsets
-                vertex_batch[i] = batch_start + i;
+            // For GPU 0, the vertex IDs start from 0
+            // For GPU 1+, add the cumulative vertex count from previous partitions
+            size_t global_vertex_id = batch_start + i;
+            if (gpu > 0) {
+                size_t offset = 0;
+                for (int prev_gpu = 0; prev_gpu < gpu; ++prev_gpu) {
+                    offset += graph_partitions[prev_gpu].num_vertices;
+                }
+                global_vertex_id += offset;
             }
+            vertex_batch[i] = global_vertex_id;
+        }
             
             // Allocate memory for batch on device
             size_t* d_vertex_batch;
