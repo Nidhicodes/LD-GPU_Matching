@@ -30,92 +30,103 @@
         }                                                                         \
     } while (0)
 
-// Warp-level shuffle reduction
-__device__ size_t warpReduceMax(size_t val, float weight, float *max_weight)
-{
-    for (int offset = 16; offset > 0; offset /= 2)
+    __device__ size_t warpReduceMax(size_t val, float weight, float *max_weight)
     {
-        float other_weight = __shfl_down_sync(0xffffffff, *max_weight, offset);
-        size_t other_val = __shfl_down_sync(0xffffffff, val, offset);
-
-        if (other_weight > *max_weight)
+        for (int offset = 16; offset > 0; offset /= 2)
         {
-            *max_weight = other_weight;
-            val = other_val;
+            float other_weight = __shfl_down_sync(0xffffffff, weight, offset);
+            size_t other_val = __shfl_down_sync(0xffffffff, val, offset);
+    
+            if (other_weight > weight)
+            {
+                weight = other_weight;
+                val = other_val;
+            }
         }
+        *max_weight = weight;
+        return val;
     }
-    return val;
-}
 
 // Kernel for the pointing phase
 __global__ void setPointersKernel(size_t *vertex_batch, size_t num_vertices_batch,
-    size_t *offsets, size_t *edges, float *weights,
-    size_t *pointers, size_t *mate)
-{
-size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-if (idx >= num_vertices_batch)
-return;
-
-size_t u = vertex_batch[idx];
-
-// Skip if already matched
-if (mate[u] != SIZE_MAX)
-return;
-
-size_t best_v = SIZE_MAX;
-float best_weight = -1.0f;
-
-// Process neighbors
-size_t start = offsets[u];
-size_t end = offsets[u + 1];
-
-for (size_t e = start; e < end; ++e)
-{
-size_t v = edges[e];
-
-// Skip if already matched
-if (mate[v] != SIZE_MAX)
-continue;
-
-float w = weights[e];
-if (w > best_weight)
-{
-best_weight = w;
-best_v = v;
-}
-}
-
-// Set pointer to heaviest available neighbor
-pointers[u] = best_v;
-}
-
-// Kernel for the matching phase
-__global__ void setMatesKernel(size_t *vertex_batch, size_t num_vertices_batch,
-                               size_t *pointers, size_t *mate)
+                               size_t *offsets, size_t *edges, float *weights,
+                               size_t *pointers, size_t *mate,
+                               size_t gpu_vertex_offset)
 {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_vertices_batch)
         return;
 
-    size_t u = vertex_batch[idx];
+    size_t local_u = vertex_batch[idx];  // Local vertex ID within partition
+    size_t global_u = local_u + gpu_vertex_offset; // Global vertex ID
 
     // Skip if already matched
-    if (mate[u] != SIZE_MAX)
+    if (mate[global_u] != SIZE_MAX)
         return;
 
-    size_t v = pointers[u];
+    size_t best_v = SIZE_MAX;
+    float best_weight = -1.0f;
+
+    // Process neighbors
+    size_t start = offsets[u];
+    size_t end = offsets[u + 1];
+
+    for (size_t e = start; e < end; ++e)
+    {
+        size_t v = edges[e];
+
+        // Skip if already matched
+        if (mate[v] != SIZE_MAX)
+            continue;
+
+        float w = weights[e];
+        if (w > best_weight)
+        {
+            best_weight = w;
+            best_v = v;
+        }
+    }
+
+    float thread_best_weight = best_weight;
+    size_t thread_best_v = best_v;
+    // Use warp reduction
+    best_v = warpReduceMax(thread_best_v, thread_best_weight, &best_weight);
+
+    // Set pointer to heaviest available neighbor
+    pointers[global_u] = best_v;
+}
+
+// Kernel for the matching phase
+__global__ void setMatesKernel(size_t *vertex_batch, size_t num_vertices_batch,
+                               size_t *pointers, size_t *mate,
+                               size_t gpu_vertex_offset, int *has_new_matches)
+{
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_vertices_batch)
+        return;
+
+    size_t local_u = vertex_batch[idx];  // Local vertex ID within partition
+    size_t global_u = local_u + gpu_vertex_offset; // Global vertex ID
+
+    // Skip if already matched
+    if (mate[global_u] != SIZE_MAX)
+        return;
+
+    size_t v = pointers[global_u];
 
     // Check for mutual pointing
-    if (v != SIZE_MAX && pointers[v] == u)
+    if (v != SIZE_MAX && pointers[v] == global_u)
     {
         // Atomic operation to ensure only one thread sets the match
-        if (atomicCAS(&mate[u], SIZE_MAX, v) == SIZE_MAX)
+        if (atomicCAS(&mate[global_u], SIZE_MAX, v) == SIZE_MAX)
         {
-            atomicCAS(&mate[v], SIZE_MAX, u);
+            atomicCAS(&mate[v], SIZE_MAX, global_u);
+            *has_new_matches = 1; // Mark that new matches were found
         }
     }
 }
 
+// Kernel to check for new matches
 __global__ void checkNewMatchesKernel(size_t num_vertices, size_t* current_mate, size_t* old_mate, int* has_new_matches) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_vertices) return;
@@ -129,7 +140,6 @@ __global__ void checkNewMatchesKernel(size_t num_vertices, size_t* current_mate,
 LD_GPU_Matcher::LD_GPU_Matcher(Graph &graph, int num_gpus, int max_batches_per_device)
     : num_gpus(num_gpus), threads_per_block(256)
 {
-
     // Initialize host arrays
     h_pointers.resize(graph.num_vertices, SIZE_MAX);
     h_mate.resize(graph.num_vertices, SIZE_MAX);
@@ -231,9 +241,10 @@ void LD_GPU_Matcher::setupDevices(int &num_gpus)
 void LD_GPU_Matcher::createBatches(int max_batches_per_device) {
     batch_offsets.resize(num_gpus);
     
-    size_t total_vertices = 0;
-    for (int gpu = 0; gpu < num_gpus; ++gpu) {
-        total_vertices += graph_partitions[gpu].num_vertices;
+    // Calculate vertex offsets for each GPU
+    gpu_vertex_offsets.resize(num_gpus, 0);
+    for (int gpu = 1; gpu < num_gpus; ++gpu) {
+        gpu_vertex_offsets[gpu] = gpu_vertex_offsets[gpu-1] + graph_partitions[gpu-1].num_vertices;
     }
     
     for (int gpu = 0; gpu < num_gpus; ++gpu) {
@@ -277,13 +288,15 @@ void LD_GPU_Matcher::cleanupNCCL()
 }
 
 bool LD_GPU_Matcher::executeIterationBatched() {
-    // Allocate device memory for the has_new_matches flag
-    int* d_has_new_matches;
     int has_new_matches = 0;
+    
+    // Allocate device memory for the has_new_matches flag on GPU 0
+    int* d_has_new_matches;
+    CUDA_CHECK(cudaSetDevice(0));
     CUDA_CHECK(cudaMalloc(&d_has_new_matches, sizeof(int)));
     CUDA_CHECK(cudaMemset(d_has_new_matches, 0, sizeof(int)));
     
-    // Save the old matching for comparison
+    // Save old matching for comparison
     std::vector<size_t> old_mate = h_mate;
     
     // Sync host-to-device for all GPUs at the start
@@ -299,6 +312,7 @@ bool LD_GPU_Matcher::executeIterationBatched() {
         
         const Graph& partition = graph_partitions[gpu];
         const std::vector<size_t>& gpu_batches = batch_offsets[gpu];
+        size_t gpu_offset = gpu_vertex_offsets[gpu];
         
         // Process each batch
         for (size_t b = 0; b < gpu_batches.size() - 1; ++b) {
@@ -309,21 +323,19 @@ bool LD_GPU_Matcher::executeIterationBatched() {
             size_t batch_end = gpu_batches[b + 1];
             size_t batch_size = batch_end - batch_start;
             
-            // Create batch of vertices with global indices
+            // Create batch of local vertex IDs within the partition
             std::vector<size_t> vertex_batch(batch_size);
             for (size_t i = 0; i < batch_size; ++i) {
-            // For GPU 0, the vertex IDs start from 0
-            // For GPU 1+, add the cumulative vertex count from previous partitions
-            size_t global_vertex_id = batch_start + i;
-            if (gpu > 0) {
-                size_t offset = 0;
-                for (int prev_gpu = 0; prev_gpu < gpu; ++prev_gpu) {
-                    offset += graph_partitions[prev_gpu].num_vertices;
+                size_t global_vertex_id = batch_start + i;
+                if (gpu > 0) {
+                    size_t offset = 0;
+                    for (int prev_gpu = 0; prev_gpu < gpu; ++prev_gpu) {
+                        offset += graph_partitions[prev_gpu].num_vertices;
+                    }
+                    global_vertex_id += offset;
                 }
-                global_vertex_id += offset;
+                vertex_batch[i] = global_vertex_id;
             }
-            vertex_batch[i] = global_vertex_id;
-        }
             
             // Allocate memory for batch on device
             size_t* d_vertex_batch;
@@ -331,12 +343,12 @@ bool LD_GPU_Matcher::executeIterationBatched() {
             CUDA_CHECK(cudaMemcpyAsync(d_vertex_batch, vertex_batch.data(), sizeof(size_t) * batch_size, 
                                       cudaMemcpyHostToDevice, stream));
             
-            // Launch kernel for pointing phase
+            // Launch kernel for pointing phase with GPU offset
             int blocks = (batch_size + threads_per_block - 1) / threads_per_block;
             setPointersKernel<<<blocks, threads_per_block, 0, stream>>>(
                 d_vertex_batch, batch_size,
                 partition.d_offsets, partition.d_edges, partition.d_weights,
-                d_pointers[gpu], d_mate[gpu]
+                d_pointers[gpu], d_mate[gpu], gpu_offset
             );
             
             // Free batch memory
@@ -370,6 +382,7 @@ bool LD_GPU_Matcher::executeIterationBatched() {
         
         const Graph& partition = graph_partitions[gpu];
         const std::vector<size_t>& gpu_batches = batch_offsets[gpu];
+        size_t gpu_offset = gpu_vertex_offsets[gpu];
         
         // Process each batch
         for (size_t b = 0; b < gpu_batches.size() - 1; ++b) {
@@ -380,7 +393,7 @@ bool LD_GPU_Matcher::executeIterationBatched() {
             size_t batch_end = gpu_batches[b + 1];
             size_t batch_size = batch_end - batch_start;
             
-            // Create batch of vertices
+            // Create batch of local vertex IDs
             std::vector<size_t> vertex_batch(batch_size);
             for (size_t i = 0; i < batch_size; ++i) {
                 vertex_batch[i] = batch_start + i;
@@ -396,7 +409,7 @@ bool LD_GPU_Matcher::executeIterationBatched() {
             int blocks = (batch_size + threads_per_block - 1) / threads_per_block;
             setMatesKernel<<<blocks, threads_per_block, 0, stream>>>(
                 d_vertex_batch, batch_size,
-                d_pointers[gpu], d_mate[gpu]
+                d_pointers[gpu], d_mate[gpu], gpu_offset, d_has_new_matches
             );
             
             // Free batch memory
@@ -415,6 +428,16 @@ bool LD_GPU_Matcher::executeIterationBatched() {
                 (const void*)d_mate[gpu], (void*)d_mate[gpu], 
                 h_mate.size(), ncclUint64, ncclMin, 
                 comms[gpu], streams[0][gpu]));
+            
+            // Also sync the has_new_matches flag
+            if (gpu > 0) {
+                int* gpu_has_new_matches;
+                CUDA_CHECK(cudaMalloc(&gpu_has_new_matches, sizeof(int)));
+                NCCL_CHECK(ncclBroadcast(
+                    (const void*)d_has_new_matches, (void*)gpu_has_new_matches, 
+                    sizeof(int), ncclInt, 0, comms[gpu], streams[0][gpu]));
+                CUDA_CHECK(cudaFree(gpu_has_new_matches));
+            }
         }
         
         // Synchronize all streams
@@ -431,22 +454,29 @@ bool LD_GPU_Matcher::executeIterationBatched() {
     // Copy updated pointers back to host
     CUDA_CHECK(cudaMemcpy(h_pointers.data(), d_pointers[0], sizeof(size_t) * h_pointers.size(), cudaMemcpyDeviceToHost));
     
-    // Allocate memory for old_mate on device and copy
-    size_t* d_old_mate;
-    CUDA_CHECK(cudaMalloc(&d_old_mate, sizeof(size_t) * h_mate.size()));
-    CUDA_CHECK(cudaMemcpy(d_old_mate, old_mate.data(), sizeof(size_t) * old_mate.size(), cudaMemcpyHostToDevice));
-    
-    // Check for new matches
-    int blocks = (h_mate.size() + threads_per_block - 1) / threads_per_block;
-    checkNewMatchesKernel<<<blocks, threads_per_block>>>(
-        h_mate.size(), d_mate[0], d_old_mate, d_has_new_matches
-    );
-    
-    // Copy result back to host
+    // Copy has_new_matches flag
     CUDA_CHECK(cudaMemcpy(&has_new_matches, d_has_new_matches, sizeof(int), cudaMemcpyDeviceToHost));
     
+    // If no matches found by direct flag, check by comparing old and new matches
+    if (has_new_matches == 0) {
+        for (size_t i = 0; i < h_mate.size(); ++i) {
+            if (h_mate[i] != old_mate[i]) {
+                has_new_matches = 1;
+                break;
+            }
+        }
+    }
+    
+    // Count current matched pairs
+    size_t matched_count = 0;
+    for (size_t i = 0; i < h_mate.size(); ++i) {
+        if (h_mate[i] != SIZE_MAX && i < h_mate[i]) {
+            matched_count++;
+        }
+    }
+    std::cout << "     Total matched pairs: " << matched_count << std::endl;
+    
     // Free device memory
-    CUDA_CHECK(cudaFree(d_old_mate));
     CUDA_CHECK(cudaFree(d_has_new_matches));
     
     std::cout << "==> New matches found: " << (has_new_matches == 1 ? "yes" : "no") << std::endl;

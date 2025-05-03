@@ -17,6 +17,7 @@ private:
     
     // Batch information
     std::vector<std::vector<size_t>> batch_offsets; // Batch vertex ranges
+    std::vector<size_t> gpu_vertex_offsets;  // Global vertex ID offset for each GPU
     
     // Host arrays for all vertices
     std::vector<size_t> h_pointers;
