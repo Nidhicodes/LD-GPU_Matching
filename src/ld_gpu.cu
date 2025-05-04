@@ -92,6 +92,8 @@ __global__ void setMatesKernel(size_t num_vertices, size_t* pointers, size_t* ma
     if (v != SIZE_MAX && pointers[v] == u) {
         mate[u] = v;
     }
+
+    // printf("Vertex %llu is matched with %llu\n", u, mate[u]);
 }
 
 // LD_GPU_Matcher implementation
@@ -195,6 +197,7 @@ void LD_GPU_Matcher::createBatches(int max_batches_per_device) {
         
         std::vector<size_t>& gpu_batches = batch_offsets[gpu];
         gpu_batches.push_back(0);
+
         
         for (size_t v = vertices_per_batch; v < partition.num_vertices; v += vertices_per_batch) {
             gpu_batches.push_back(v);
@@ -243,7 +246,7 @@ bool LD_GPU_Matcher::executeIterationBatched() {
         const std::vector<size_t>& gpu_batches = batch_offsets[gpu];
 
         
-        
+        std::cout << "==> GPU " << gpu << " has " << (gpu_batches.size() - 1) << " batches." << std::endl;
         // Process each batch
         for (size_t b = 0; b < gpu_batches.size() - 1; ++b) {
             
@@ -275,6 +278,9 @@ bool LD_GPU_Matcher::executeIterationBatched() {
                 partition.d_offsets, partition.d_edges, partition.d_weights,
                 d_pointers[gpu], d_mate[gpu]
             );
+
+            CUDA_CHECK(cudaMemcpyAsync(h_pointers.data(), d_pointers[gpu], sizeof(size_t) * h_pointers.size(), 
+                                       cudaMemcpyDeviceToHost, stream));
             
             // Free batch memory
             CUDA_CHECK(cudaFree(d_vertex_batch));
@@ -285,9 +291,9 @@ bool LD_GPU_Matcher::executeIterationBatched() {
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }
         
-        // Copy pointers back to host
-        CUDA_CHECK(cudaMemcpy(h_pointers.data(), d_pointers[gpu], sizeof(size_t) * h_pointers.size(), cudaMemcpyDeviceToHost));
+        
     }
+
     
     // Matching phase
     for (int gpu = 0; gpu < num_gpus; ++gpu) {
@@ -336,7 +342,7 @@ void LD_GPU_Matcher::computeMatching() {
     //     h_pointers[i] = SIZE_MAX;
     // }
     
-    while (continue_matching || iteration == 1) {
+    while (continue_matching) {
         std::cout << "  [Starting iteration " << iteration << "]" << std::endl;
         
         continue_matching = executeIterationBatched();
